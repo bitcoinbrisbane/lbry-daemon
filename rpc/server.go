@@ -20,6 +20,7 @@ import "runtime/debug"
 import "slices"
 import "strconv"
 import "strings"
+import "time"
 
 import "google.golang.org/protobuf/encoding/protowire"
 
@@ -546,27 +547,60 @@ func handleJSONRPCMessageClaimList(rpcServer RPCServer, w http.ResponseWriter, r
 	handleUnauthorized(w)
 }
 
+// Hub connection limits. A hub name can resolve to several addresses, and one that accepts the
+// connection but never answers must not hold a request up.
+const hubDialTimeout = 3 * time.Second
+
+// A variable so tests can shorten it.
+var hubCallTimeout = 15 * time.Second
+
+var lookupHost = net.LookupHost
+
+// SendJSON sends one JSON-RPC request to a wallet server and returns its decoded reply. It tries each
+// address the host resolves to, in turn, and moves on from one that fails or sends nothing.
 func SendJSON(host string, port int, req any) (map[string]any, error) {
-	conn, err := net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	data, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	addrs, err := lookupHost(host)
+	if err != nil {
+		return nil, fmt.Errorf("looking up %s: %w", host, err)
+	}
+	var lastErr error = fmt.Errorf("%s has no addresses", host)
+	for _, addr := range addrs {
+		resp, err := sendJSONTo(net.JoinHostPort(addr, strconv.Itoa(port)), data)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+func sendJSONTo(address string, data []byte) (map[string]any, error) {
+	conn, err := net.DialTimeout("tcp", address, hubDialTimeout)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(hubCallTimeout))
 
-	data, _ := json.Marshal(req)
-
-	conn.Write(append(data, '\n'))
-
-	line, _ := bufio.NewReader(conn).ReadString('\n')
-	if len(line) > 0 && line[len(line)-1] == '\n' {
-		line = line[:len(line)-1]
+	if _, err := conn.Write(append(data, '\n')); err != nil {
+		return nil, fmt.Errorf("%s: %w", address, err)
 	}
-	if len(line) > 0 && line[len(line)-1] == '\r' {
-		line = line[:len(line)-1]
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	line = strings.TrimRight(line, "\r\n")
+	if line == "" {
+		if err == nil {
+			err = fmt.Errorf("empty reply")
+		}
+		return nil, fmt.Errorf("%s: %w", address, err)
 	}
-
 	var resp map[string]any
-	json.Unmarshal([]byte(line), &resp)
+	if err := json.Unmarshal([]byte(line), &resp); err != nil {
+		return nil, fmt.Errorf("%s: bad reply: %w", address, err)
+	}
 	return resp, nil
 }
 
@@ -624,72 +658,114 @@ func handleJSONRPCMessageClaimSearch(rpcServer RPCServer, w http.ResponseWriter,
 	if authenticated {
 		_ = user
 
-		searchResp, _ := SendJSON(TMP_HUB_HOSTNAME, 50001, map[string]any{
+		paramsMap, _ := params.(map[string]any)
+		page, pageSize := paginationFrom(paramsMap)
+
+		searchResp, err := SendJSON(TMP_HUB_HOSTNAME, 50001, map[string]any{
 			"jsonrpc": "2.0",
 			"id":      rand.Int() + 1,
 			"method":  "blockchain.claimtrie.search",
 			"params":  params,
 		})
-
-		decodedBase64, _ := base64.StdEncoding.DecodeString(searchResp["result"].(string))
-		decodedProtobuf, _ := DecodeRawProto(decodedBase64)
+		if err != nil {
+			sendErrorResponse(w, 502, "Could not reach a wallet server: "+err.Error())
+			return
+		}
+		encoded, isString := searchResp["result"].(string)
+		if !isString {
+			sendErrorResponse(w, 502, "The wallet server rejected the search: "+hubErrorMessage(searchResp))
+			return
+		}
+		decodedBase64, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			sendErrorResponse(w, 502, "The wallet server sent a search result that is not base64.")
+			return
+		}
+		decodedProtobuf, err := DecodeRawProto(decodedBase64)
+		if err != nil {
+			sendErrorResponse(w, 502, "The wallet server sent a search result that could not be decoded.")
+			return
+		}
 
 		claims, ok := decodedProtobuf[1].([]any)
 
 		txIDs := []string{}
-
 		if ok {
 			for _, claim := range claims {
-				claimMap := claim.(map[int]any)
-				txidValue, txidOk := claimMap[1]
-				if txidOk {
-					txidBytes := txidValue.([]byte)
+				claimMap, isMap := claim.(map[int]any)
+				if !isMap {
+					continue
+				}
+				if txidBytes, txidOk := claimMap[1].([]byte); txidOk {
+					txidBytes = slices.Clone(txidBytes)
 					slices.Reverse(txidBytes)
-					txID := hex.EncodeToString(txidBytes)
-					txIDs = append(txIDs, txID)
+					txIDs = append(txIDs, hex.EncodeToString(txidBytes))
 				}
 			}
 		}
 
-		transactionResp, _ := SendJSON(TMP_HUB_HOSTNAME, 50001, map[string]any{
-			"jsonrpc": "2.0",
-			"id":      rand.Int() + 1,
-			"method":  "blockchain.transaction.get_batch",
-			"params":  txIDs,
-		})
-
-		transactionData := transactionResp["result"].(map[string]any)
-
-		var items []map[string]any = []map[string]any{}
-
-		if ok {
-			for _, claim := range claims {
-				claimMap := claim.(map[int]any)
-
-				item := convertProtobufToClaim(claimMap, transactionData)
-
-				items = append(items, item)
+		transactionData := map[string]any{}
+		if len(txIDs) > 0 {
+			transactionResp, err := SendJSON(TMP_HUB_HOSTNAME, 50001, map[string]any{
+				"jsonrpc": "2.0",
+				"id":      rand.Int() + 1,
+				"method":  "blockchain.transaction.get_batch",
+				"params":  txIDs,
+			})
+			if err != nil {
+				sendErrorResponse(w, 502, "Could not reach a wallet server: "+err.Error())
+				return
+			}
+			var isMap bool
+			if transactionData, isMap = transactionResp["result"].(map[string]any); !isMap {
+				sendErrorResponse(w, 502, "The wallet server could not return the transactions: "+hubErrorMessage(transactionResp))
+				return
 			}
 		}
 
-		totalItems, okTotal := (decodedProtobuf[3]).(uint64)
-
-		var pageSize float64 = 20
-		var totalItemsFloat float64 = 0
-		if okTotal {
-			totalItemsFloat = float64(totalItems)
+		var items []map[string]any = []map[string]any{}
+		if ok {
+			for _, claim := range claims {
+				if claimMap, isMap := claim.(map[int]any); isMap {
+					items = append(items, convertProtobufToClaim(claimMap, transactionData))
+				}
+			}
 		}
+
+		totalItems, _ := (decodedProtobuf[3]).(uint64)
 
 		sendResultResponse(w, map[string]any{
 			"items":       items,
-			"page":        1,
+			"page":        page,
 			"page_size":   pageSize,
 			"total_items": totalItems,
-			"total_pages": math.Ceil(totalItemsFloat / pageSize),
+			"total_pages": math.Ceil(float64(totalItems) / pageSize),
 		})
 		return
 	}
 	handleUnauthorized(w)
+}
+
+// paginationFrom reads page and page_size from a request, with the SDK's defaults (1 and 10).
+func paginationFrom(params map[string]any) (page float64, pageSize float64) {
+	page, pageSize = 1, 10
+	if v, ok := params["page"].(float64); ok && v >= 1 {
+		page = v
+	}
+	if v, ok := params["page_size"].(float64); ok && v >= 1 {
+		pageSize = v
+	}
+	return page, pageSize
+}
+
+// hubErrorMessage describes a wallet-server reply that has no result.
+func hubErrorMessage(resp map[string]any) string {
+	if e, ok := resp["error"].(map[string]any); ok {
+		if message, ok := e["message"].(string); ok {
+			return message
+		}
+	}
+	return "unexpected reply"
 }
 
 func handleJSONRPCMessageCollectionAbandon(rpcServer RPCServer, w http.ResponseWriter, req *http.Request, params any) {
