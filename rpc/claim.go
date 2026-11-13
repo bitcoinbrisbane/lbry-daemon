@@ -2,6 +2,7 @@ package rpc
 
 import "encoding/hex"
 import "slices"
+import "log"
 
 func convertProtobufToClaim(protobuf map[int]any, transactions map[string]any) map[string]any {
 	claim := map[string]any{}
@@ -10,16 +11,24 @@ func convertProtobufToClaim(protobuf map[int]any, transactions map[string]any) m
 
 	var transactionID string
 
+	// The hub sends the transaction hash in internal byte order; wallet servers and explorers key
+	// transactions by the reversed (display) form, which is also what lbrynet reports as txid.
 	txidValue, txidOk := protobuf[1]
 	if txidOk {
-		txid := txidValue.([]byte)
-		transactionID = hex.EncodeToString(txid)
-		slices.Reverse(txid)
-		claim["txid"] = hex.EncodeToString(txid)
+		if wire, isBytes := txidValue.([]byte); isBytes {
+			transactionID = displayTxID(wire)
+			claim["txid"] = transactionID
+		}
 	}
 
-	transactionData := transactions[transactionID].([]any)
-	transactionBytes := transactionData[0].(string)
+	transactionData, hasTransaction := transactions[transactionID].([]any)
+	if !hasTransaction || len(transactionData) == 0 {
+		return claim
+	}
+	transactionBytes, isString := transactionData[0].(string)
+	if !isString {
+		return claim
+	}
 	//transactionInfo := transactionData[1].(map[string]any)
 
 	output, _ := parseTxOutputs(transactionBytes)
@@ -32,7 +41,10 @@ func convertProtobufToClaim(protobuf map[int]any, transactions map[string]any) m
 		}
 	}
 
-	if len(claimScript.ClaimData) < 85 {
+	if claimScript != nil {
+		claim["name"] = claimScript.Name
+	}
+	if claimScript == nil || len(claimScript.ClaimData) < 85 {
 		// TODO: Older schemes
 		return claim
 	}
@@ -300,4 +312,26 @@ func convertProtobufToClaim(protobuf map[int]any, transactions map[string]any) m
 	// 	claim["_2"] = decodedProtobufClaimData
 
 	return claim
+}
+
+// displayTxID returns a hub transaction hash as the hex txid used by wallet servers and explorers.
+func displayTxID(wire []byte) string {
+	display := slices.Clone(wire)
+	slices.Reverse(display)
+	return hex.EncodeToString(display)
+}
+
+// safeConvertProtobufToClaim is convertProtobufToClaim for data we do not control: a claim the
+// converter cannot read is reported with what is known (its txid) instead of failing the request.
+func safeConvertProtobufToClaim(protobuf map[int]any, transactions map[string]any) (claim map[string]any) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("claim_search: could not convert a claim: %v", r)
+			claim = map[string]any{"type": "claim"}
+			if wire, ok := protobuf[1].([]byte); ok {
+				claim["txid"] = displayTxID(wire)
+			}
+		}
+	}()
+	return convertProtobufToClaim(protobuf, transactions)
 }
