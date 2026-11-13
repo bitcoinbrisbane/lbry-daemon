@@ -11,6 +11,7 @@ import "lbry/daemon/reflector"
 import "lbry/daemon/rpc"
 import "lbry/daemon/wallet"
 import "net"
+import "os"
 import "strconv"
 import "sync"
 
@@ -50,7 +51,7 @@ func main() {
 	if rpcServer != nil {
 		wg.Go(func() {
 			fmt.Println("Starting RPC server on port 5279.")
-			listener, err := getTCPListener("", 5279)
+			listener, err := getTCPListener(getAPIHost(), 5279)
 			if err != nil {
 				fmt.Println("Error when getting TCP listener.")
 				return
@@ -112,6 +113,16 @@ func main() {
 	if runningServers != 0 {
 		fmt.Println("All servers have stopped.")
 	}
+}
+
+// getAPIHost returns the interface the RPC API listens on. It defaults to
+// loopback only; set LBRY_API_HOST (for example "0.0.0.0") to expose it, and
+// set ADMIN_USERNAME / ADMIN_PASSWORD so remote clients can authenticate.
+func getAPIHost() string {
+	if host := os.Getenv("LBRY_API_HOST"); host != "" {
+		return host
+	}
+	return "127.0.0.1"
 }
 
 func getTCPListener(hostname string, port int) (net.Listener, error) {

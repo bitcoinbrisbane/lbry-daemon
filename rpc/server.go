@@ -82,7 +82,10 @@ func (rpcServer RPCServer) handleJSONRPC(w http.ResponseWriter, req *http.Reques
 
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if origin := req.Header.Get("Origin"); origin != "" && rpcServer.authManager.IsOriginAllowed(origin) {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Add("Vary", "Origin")
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Server", "LBRYd/"+info.Main.Version)
 
