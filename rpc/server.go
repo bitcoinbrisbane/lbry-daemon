@@ -16,7 +16,6 @@ import "net"
 import "net/http"
 import "os"
 import "os/exec"
-import "regexp"
 import "runtime/debug"
 import "slices"
 import "strconv"
@@ -1802,16 +1801,30 @@ func handleJSONRPCMessageWalletSend(rpcServer RPCServer, w http.ResponseWriter, 
 }
 
 func handleJSONRPCMessageWalletStatus(rpcServer RPCServer, w http.ResponseWriter, req *http.Request, params any) {
-	user, authenticated := rpcServer.authManager.ValidateGuest(req)
+	user, authenticated := rpcServer.authManager.ValidateGuest(req) // Relaxed: the splash screen needs it before any login
 	if authenticated {
-		_ = user
-
-		if regexp.MustCompile(`(?:^|\s)LBRY/(\d+)\.(\d+)\.(\d+)(?:\s|$)`).MatchString(req.UserAgent()) {
-			// Backward compatibility
-			sendResultResponse(w, map[string]any{})
+		paramsMap, paramsMapOk := params.(map[string]any)
+		if !paramsMapOk {
+			paramsMap = map[string]any{}
+		}
+		walletID := ""
+		if value, hasWalletID := paramsMap["wallet_id"]; hasWalletID && value != nil {
+			var isString bool
+			if walletID, isString = value.(string); !isString {
+				sendErrorResponse(w, 400, "Parameter 'wallet_id' not of type string.")
+				return
+			}
+		}
+		status, found := rpcServer.walletManager.Status(user, walletID)
+		if !found {
+			sendErrorResponse(w, 400, "Wallet does not exist.")
 			return
 		}
-		sendErrorResponse(w, 501, "Wallet commands are not implemented for now.")
+		sendResultResponse(w, map[string]any{
+			"is_encrypted": status.IsEncrypted,
+			"is_syncing":   status.IsSyncing,
+			"is_locked":    status.IsLocked,
+		})
 		return
 	}
 	handleUnauthorized(w)

@@ -48,6 +48,19 @@ func (wallet *Wallet) IsLocked() bool {
 	return false
 }
 
+// IsEncrypted reports whether the wallet is locked, or was unlocked with a password (lbry-sdk
+// Wallet.is_encrypted).
+func (wallet *Wallet) IsEncrypted() bool {
+	return wallet.IsLocked() || wallet.password != ""
+}
+
+// Status is what wallet_status reports.
+type Status struct {
+	IsEncrypted bool
+	IsSyncing   bool
+	IsLocked    bool
+}
+
 type WalletManager struct {
 	mutex   sync.Mutex
 	wallets []*Wallet
@@ -179,6 +192,26 @@ func (walletManager *WalletManager) Unlock(user *auth.User, id string, password 
 		wallet.password = password
 	}
 	return true
+}
+
+// Status returns the lock state of a wallet, or of the default wallet when id is empty ("default_wallet",
+// else the first one loaded). With no wallet loaded nothing is encrypted or locked. It returns false
+// if id names a wallet that is not loaded. IsSyncing stays false until there is a wallet-server client.
+func (walletManager *WalletManager) Status(user *auth.User, id string) (Status, bool) {
+	walletManager.mutex.Lock()
+	defer walletManager.mutex.Unlock()
+	var wallet *Wallet
+	if id != "" {
+		if wallet = walletManager.find(id); wallet == nil {
+			return Status{}, false
+		}
+	} else if wallet = walletManager.find("default_wallet"); wallet == nil && len(walletManager.wallets) > 0 {
+		wallet = walletManager.wallets[0]
+	}
+	if wallet == nil {
+		return Status{}, true
+	}
+	return Status{IsEncrypted: wallet.IsEncrypted(), IsLocked: wallet.IsLocked()}, true
 }
 
 func (walletManager *WalletManager) find(id string) *Wallet {
