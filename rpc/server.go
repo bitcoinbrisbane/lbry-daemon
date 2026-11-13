@@ -17,7 +17,6 @@ import "net/http"
 import "os"
 import "os/exec"
 import "runtime/debug"
-import "slices"
 import "strconv"
 import "strings"
 import "time"
@@ -697,9 +696,7 @@ func handleJSONRPCMessageClaimSearch(rpcServer RPCServer, w http.ResponseWriter,
 					continue
 				}
 				if txidBytes, txidOk := claimMap[1].([]byte); txidOk {
-					txidBytes = slices.Clone(txidBytes)
-					slices.Reverse(txidBytes)
-					txIDs = append(txIDs, hex.EncodeToString(txidBytes))
+					txIDs = append(txIDs, displayTxID(txidBytes))
 				}
 			}
 		}
@@ -727,7 +724,7 @@ func handleJSONRPCMessageClaimSearch(rpcServer RPCServer, w http.ResponseWriter,
 		if ok {
 			for _, claim := range claims {
 				if claimMap, isMap := claim.(map[int]any); isMap {
-					items = append(items, convertProtobufToClaim(claimMap, transactionData))
+					items = append(items, safeConvertProtobufToClaim(claimMap, transactionData))
 				}
 			}
 		}
@@ -948,9 +945,7 @@ func handleJSONRPCMessageGet(rpcServer RPCServer, w http.ResponseWriter, req *ht
 				claimMap := claim.(map[int]any)
 				txidValue, txidOk := claimMap[1]
 				if txidOk {
-					txidBytes := txidValue.([]byte)
-					slices.Reverse(txidBytes)
-					txID := hex.EncodeToString(txidBytes)
+					txID := displayTxID(txidValue.([]byte))
 					txIDs = append(txIDs, txID)
 				}
 			}
@@ -1131,9 +1126,7 @@ func handleJSONRPCMessageResolve(rpcServer RPCServer, w http.ResponseWriter, req
 				claimMap := claim.(map[int]any)
 				txidValue, txidOk := claimMap[1]
 				if txidOk {
-					txidBytes := txidValue.([]byte)
-					slices.Reverse(txidBytes)
-					txID := hex.EncodeToString(txidBytes)
+					txID := displayTxID(txidValue.([]byte))
 					txIDs = append(txIDs, txID)
 				}
 			}
@@ -1372,9 +1365,7 @@ func handleJSONRPCMessageStreamCostEstimate(rpcServer RPCServer, w http.Response
 				claimMap := claim.(map[int]any)
 				txidValue, txidOk := claimMap[1]
 				if txidOk {
-					txidBytes := txidValue.([]byte)
-					slices.Reverse(txidBytes)
-					txID := hex.EncodeToString(txidBytes)
+					txID := displayTxID(txidValue.([]byte))
 					txIDs = append(txIDs, txID)
 				}
 			}

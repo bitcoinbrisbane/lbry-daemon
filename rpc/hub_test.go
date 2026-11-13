@@ -152,3 +152,25 @@ func TestClaimSearchWhenNoHubIsReachable(t *testing.T) {
 		t.Fatalf("expected a 502 error response, got %v", body)
 	}
 }
+
+func TestDisplayTxIDReversesWithoutMutating(t *testing.T) {
+	wire := []byte{0x01, 0x02, 0x03}
+	if got := displayTxID(wire); got != "030201" {
+		t.Fatalf("got %s", got)
+	}
+	if wire[0] != 1 || wire[2] != 3 {
+		t.Fatalf("input was modified: %v", wire)
+	}
+}
+
+func TestConvertSurvivesMissingTransaction(t *testing.T) {
+	claim := safeConvertProtobufToClaim(map[int]any{1: []byte{0x01, 0x02, 0x03}}, map[string]any{})
+	if claim["txid"] != "030201" || claim["type"] != "claim" {
+		t.Fatalf("got %v", claim)
+	}
+	// A transaction entry of the wrong shape must not panic either.
+	claim = safeConvertProtobufToClaim(map[int]any{1: []byte{0x01}}, map[string]any{"01": "nope"})
+	if claim["txid"] != "01" {
+		t.Fatalf("got %v", claim)
+	}
+}
