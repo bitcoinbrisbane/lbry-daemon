@@ -174,3 +174,22 @@ func TestConvertSurvivesMissingTransaction(t *testing.T) {
 		t.Fatalf("got %v", claim)
 	}
 }
+
+func TestHubSearchParamsUseOffsetAndLimit(t *testing.T) {
+	got := hubSearchParams(map[string]any{"page": 3.0, "page_size": 5.0, "text": "x"}, 3, 5)
+	if got["offset"] != 10.0 || got["limit"] != 5.0 || got["text"] != "x" {
+		t.Fatalf("got %v", got)
+	}
+	if _, has := got["page"]; has {
+		t.Fatalf("page should not reach the hub: %v", got)
+	}
+	if _, has := got["page_size"]; has {
+		t.Fatalf("page_size should not reach the hub: %v", got)
+	}
+}
+
+func TestPaginationCapsPageSizeAtFifty(t *testing.T) {
+	if _, size := paginationFrom(map[string]any{"page_size": 500.0}); size != 50 {
+		t.Fatalf("got %v", size)
+	}
+}

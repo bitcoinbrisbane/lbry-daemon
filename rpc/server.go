@@ -664,7 +664,7 @@ func handleJSONRPCMessageClaimSearch(rpcServer RPCServer, w http.ResponseWriter,
 			"jsonrpc": "2.0",
 			"id":      rand.Int() + 1,
 			"method":  "blockchain.claimtrie.search",
-			"params":  params,
+			"params":  hubSearchParams(paramsMap, page, pageSize),
 		})
 		if err != nil {
 			sendErrorResponse(w, 502, "Could not reach a wallet server: "+err.Error())
@@ -743,14 +743,29 @@ func handleJSONRPCMessageClaimSearch(rpcServer RPCServer, w http.ResponseWriter,
 	handleUnauthorized(w)
 }
 
-// paginationFrom reads page and page_size from a request, with the SDK's defaults (1 and 10).
+// hubSearchParams turns a claim_search request into what the hub expects: page and page_size become
+// offset and limit, as in lbry-sdk's jsonrpc_claim_search.
+func hubSearchParams(params map[string]any, page float64, pageSize float64) map[string]any {
+	out := make(map[string]any, len(params)+2)
+	for key, value := range params {
+		if key != "page" && key != "page_size" {
+			out[key] = value
+		}
+	}
+	out["offset"] = pageSize * (page - 1)
+	out["limit"] = pageSize
+	return out
+}
+
+// paginationFrom reads page and page_size from a request, with the SDK's defaults (1 and 10) and its
+// cap of 50 items per page.
 func paginationFrom(params map[string]any) (page float64, pageSize float64) {
 	page, pageSize = 1, 10
 	if v, ok := params["page"].(float64); ok && v >= 1 {
 		page = v
 	}
 	if v, ok := params["page_size"].(float64); ok && v >= 1 {
-		pageSize = v
+		pageSize = math.Min(v, 50)
 	}
 	return page, pageSize
 }

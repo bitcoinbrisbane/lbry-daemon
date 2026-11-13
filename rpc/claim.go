@@ -41,6 +41,9 @@ func convertProtobufToClaim(protobuf map[int]any, transactions map[string]any) m
 		}
 	}
 
+	if claimScript != nil {
+		claim["name"] = claimScript.Name
+	}
 	if claimScript == nil || len(claimScript.ClaimData) < 85 {
 		// TODO: Older schemes
 		return claim
