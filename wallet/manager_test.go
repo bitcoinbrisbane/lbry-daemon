@@ -95,3 +95,28 @@ func TestAESPythonVector(t *testing.T) {
 		t.Fatalf("got %q, %v", out, err)
 	}
 }
+
+func TestStatus(t *testing.T) {
+	manager := fixture(t)
+	if s, ok := manager.Status(nil, ""); !ok || s.IsLocked || s.IsEncrypted {
+		t.Fatalf("default wallet: %+v %v", s, ok)
+	}
+	if s, ok := manager.Status(nil, "secret"); !ok || !s.IsLocked || !s.IsEncrypted {
+		t.Fatalf("locked wallet: %+v %v", s, ok)
+	}
+	manager.Unlock(nil, "secret", "hunter2")
+	if s, _ := manager.Status(nil, "secret"); s.IsLocked || !s.IsEncrypted {
+		t.Fatalf("unlocked with password should stay encrypted: %+v", s)
+	}
+	manager.Lock(nil, "secret")
+	if s, _ := manager.Status(nil, "secret"); !s.IsLocked {
+		t.Fatalf("relocked wallet: %+v", s)
+	}
+	if _, ok := manager.Status(nil, "missing"); ok {
+		t.Fatal("unknown wallet reported found")
+	}
+	empty, _ := NewManager(filepath.Join(t.TempDir(), "nope"))
+	if s, ok := empty.Status(nil, ""); !ok || s != (Status{}) {
+		t.Fatalf("empty manager: %+v %v", s, ok)
+	}
+}
