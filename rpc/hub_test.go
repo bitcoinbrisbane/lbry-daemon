@@ -4,14 +4,18 @@ import (
 	"bufio"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"lbry/daemon/auth"
+	"lbry/daemon/wallet"
 )
 
 // fakeHub listens on address and answers every request line with reply(). A nil reply makes it accept
@@ -191,5 +195,81 @@ func TestHubSearchParamsUseOffsetAndLimit(t *testing.T) {
 func TestPaginationCapsPageSizeAtFifty(t *testing.T) {
 	if _, size := paginationFrom(map[string]any{"page_size": 500.0}); size != 50 {
 		t.Fatalf("got %v", size)
+	}
+}
+
+type stubHub struct{ err error }
+
+func (h stubHub) Call(method string, params any) (any, error) {
+	if h.err != nil {
+		return nil, h.err
+	}
+	if method == "blockchain.scripthash.get_history" {
+		return []any{}, nil
+	}
+	return map[string]any{"confirmed": 0.0, "unconfirmed": 0.0}, nil
+}
+
+func walletBalanceServer(t *testing.T, hub wallet.Hub) RPCServer {
+	t.Helper()
+	dir := t.TempDir()
+	raw := `{"name":"My Wallet","accounts":[{"name":"a","public_key":"xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw"}]}`
+	if err := os.WriteFile(filepath.Join(dir, "default_wallet"), []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := wallet.NewManager(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return RPCServer{authManager: &auth.AuthManager{}, walletManager: manager, hub: hub}
+}
+
+func walletBalance(t *testing.T, server RPCServer, params map[string]any) map[string]any {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(""))
+	req.RemoteAddr = "127.0.0.1:40000"
+	req.Host = "localhost:5279" // the auth manager only trusts loopback hosts
+	w := httptest.NewRecorder()
+	handleJSONRPCMessageWalletBalance(server, w, req, params)
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("not JSON: %q", w.Body.String())
+	}
+	return body
+}
+
+func TestWalletBalanceShape(t *testing.T) {
+	body := walletBalance(t, walletBalanceServer(t, stubHub{}), map[string]any{})
+	result, ok := body["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("no result: %v", body)
+	}
+	if result["total"] != "0.0" || result["available"] != "0.0" || result["reserved"] != "0.0" {
+		t.Fatalf("%v", result)
+	}
+	if subtotals, _ := result["reserved_subtotals"].(map[string]any); subtotals["claims"] != "0.0" || subtotals["supports"] != "0.0" || subtotals["tips"] != "0.0" {
+		t.Fatalf("%v", result)
+	}
+}
+
+func TestWalletBalanceErrorCodes(t *testing.T) {
+	cases := map[string]struct {
+		hub    wallet.Hub
+		params map[string]any
+		code   float64
+	}{
+		"unknown wallet":     {stubHub{}, map[string]any{"wallet_id": "nope"}, 400},
+		"bad wallet_id":      {stubHub{}, map[string]any{"wallet_id": 5.0}, 400},
+		"bad confirmations":  {stubHub{}, map[string]any{"confirmations": "x"}, 400},
+		"too many":           {stubHub{}, map[string]any{"confirmations": 3.0}, 400},
+		"hub failure is 502": {stubHub{err: errors.New("down")}, map[string]any{}, 502},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			body := walletBalance(t, walletBalanceServer(t, c.hub), c.params)
+			if e, ok := body["error"].(map[string]any); !ok || e["code"] != c.code {
+				t.Fatalf("got %v", body)
+			}
+		})
 	}
 }
