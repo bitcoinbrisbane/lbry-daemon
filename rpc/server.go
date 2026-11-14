@@ -20,6 +20,7 @@ import "os/exec"
 import "runtime/debug"
 import "strconv"
 import "strings"
+import "sync"
 import "time"
 
 import "google.golang.org/protobuf/encoding/protowire"
@@ -551,12 +552,52 @@ func handleJSONRPCMessageClaimList(rpcServer RPCServer, w http.ResponseWriter, r
 
 // Hub connection limits. A hub name can resolve to several addresses, and one that accepts the
 // connection but never answers must not hold a request up.
-const hubDialTimeout = 3 * time.Second
+const (
+	hubDialTimeout = 3 * time.Second
+	// hubFirstByteTimeout is how long an address gets to start answering before the next is tried.
+	hubFirstByteTimeout = 6 * time.Second
+	// hubBackoff is how long an address that failed is tried last.
+	hubBackoff = 2 * time.Minute
+)
 
 // A variable so tests can shorten it.
 var hubCallTimeout = 15 * time.Second
 
 var lookupHost = net.LookupHost
+
+// hubDown remembers when each address last failed, so one dead address is not waited on again by every
+// request that follows (a balance makes dozens of calls).
+var hubDown = struct {
+	sync.Mutex
+	until map[string]time.Time
+}{until: map[string]time.Time{}}
+
+// orderAddresses puts addresses that recently failed after the ones that did not, keeping DNS order
+// within each group.
+func orderAddresses(addrs []string) []string {
+	hubDown.Lock()
+	defer hubDown.Unlock()
+	now := time.Now()
+	var healthy, failed []string
+	for _, addr := range addrs {
+		if hubDown.until[addr].After(now) {
+			failed = append(failed, addr)
+		} else {
+			healthy = append(healthy, addr)
+		}
+	}
+	return append(healthy, failed...)
+}
+
+func markHub(addr string, ok bool) {
+	hubDown.Lock()
+	defer hubDown.Unlock()
+	if ok {
+		delete(hubDown.until, addr)
+	} else {
+		hubDown.until[addr] = time.Now().Add(hubBackoff)
+	}
+}
 
 // SendJSON sends one JSON-RPC request to a wallet server and returns its decoded reply. It tries each
 // address the host resolves to, in turn, and moves on from one that fails or sends nothing.
@@ -570,11 +611,13 @@ func SendJSON(host string, port int, req any) (map[string]any, error) {
 		return nil, fmt.Errorf("looking up %s: %w", host, err)
 	}
 	var lastErr error = fmt.Errorf("%s has no addresses", host)
-	for _, addr := range addrs {
+	for _, addr := range orderAddresses(addrs) {
 		resp, err := sendJSONTo(net.JoinHostPort(addr, strconv.Itoa(port)), data)
 		if err == nil {
+			markHub(addr, true)
 			return resp, nil
 		}
+		markHub(addr, false)
 		lastErr = err
 	}
 	return nil, lastErr
@@ -586,12 +629,18 @@ func sendJSONTo(address string, data []byte) (map[string]any, error) {
 		return nil, err
 	}
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(hubCallTimeout))
+	start := time.Now()
+	conn.SetDeadline(start.Add(min(hubFirstByteTimeout, hubCallTimeout)))
 
 	if _, err := conn.Write(append(data, '\n')); err != nil {
 		return nil, fmt.Errorf("%s: %w", address, err)
 	}
-	line, err := bufio.NewReader(conn).ReadString('\n')
+	reader := bufio.NewReader(conn)
+	if _, err := reader.Peek(1); err != nil { // wait for the first byte of the reply
+		return nil, fmt.Errorf("%s: no reply: %w", address, err)
+	}
+	conn.SetDeadline(start.Add(hubCallTimeout)) // a reply that has started may take longer
+	line, err := reader.ReadString('\n')
 	line = strings.TrimRight(line, "\r\n")
 	if line == "" {
 		if err == nil {

@@ -51,7 +51,15 @@ func useHubAddresses(t *testing.T, addrs ...string) {
 	previousLookup, previousCall := lookupHost, hubCallTimeout
 	lookupHost = func(string) ([]string, error) { return addrs, nil }
 	hubCallTimeout = 300 * time.Millisecond
-	t.Cleanup(func() { lookupHost, hubCallTimeout = previousLookup, previousCall })
+	hubDown.Lock()
+	hubDown.until = map[string]time.Time{}
+	hubDown.Unlock()
+	t.Cleanup(func() {
+		lookupHost, hubCallTimeout = previousLookup, previousCall
+		hubDown.Lock()
+		hubDown.until = map[string]time.Time{}
+		hubDown.Unlock()
+	})
 }
 
 func TestSendJSONSkipsASilentAddress(t *testing.T) {
@@ -271,5 +279,37 @@ func TestWalletBalanceErrorCodes(t *testing.T) {
 				t.Fatalf("got %v", body)
 			}
 		})
+	}
+}
+
+func TestSendJSONRemembersADeadAddress(t *testing.T) {
+	fakeHub(t, "127.0.0.2:50001", nil)
+	fakeHub(t, "127.0.0.1:50001", func(string) string { return `{"jsonrpc":"2.0","id":1,"result":"ok"}` })
+	useHubAddresses(t, "127.0.0.2", "127.0.0.1")
+
+	if _, err := SendJSON("hub.example", 50001, map[string]any{}); err != nil { // pays the timeout once
+		t.Fatal(err)
+	}
+	start := time.Now()
+	for i := 0; i < 5; i++ {
+		if _, err := SendJSON("hub.example", 50001, map[string]any{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if elapsed := time.Since(start); elapsed > hubCallTimeout/2 {
+		t.Fatalf("later calls still waited on the dead address: %v", elapsed)
+	}
+}
+
+func TestOrderAddressesPutsFailedLast(t *testing.T) {
+	useHubAddresses(t)
+	markHub("a", false)
+	got := orderAddresses([]string{"a", "b", "c"})
+	if got[0] != "b" || got[1] != "c" || got[2] != "a" {
+		t.Fatalf("got %v", got)
+	}
+	markHub("a", true)
+	if got := orderAddresses([]string{"a", "b"}); got[0] != "a" {
+		t.Fatalf("recovered address should be tried in DNS order again: %v", got)
 	}
 }
