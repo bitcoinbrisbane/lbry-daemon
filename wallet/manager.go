@@ -200,18 +200,29 @@ func (walletManager *WalletManager) Unlock(user *auth.User, id string, password 
 func (walletManager *WalletManager) Status(user *auth.User, id string) (Status, bool) {
 	walletManager.mutex.Lock()
 	defer walletManager.mutex.Unlock()
-	var wallet *Wallet
-	if id != "" {
-		if wallet = walletManager.find(id); wallet == nil {
-			return Status{}, false
-		}
-	} else if wallet = walletManager.find("default_wallet"); wallet == nil && len(walletManager.wallets) > 0 {
-		wallet = walletManager.wallets[0]
+	wallet := walletManager.resolve(id)
+	if id != "" && wallet == nil {
+		return Status{}, false
 	}
 	if wallet == nil {
 		return Status{}, true
 	}
 	return Status{IsEncrypted: wallet.IsEncrypted(), IsLocked: wallet.IsLocked()}, true
+}
+
+// resolve returns the wallet with that id, or the default wallet for an empty id ("default_wallet",
+// else the first one loaded). The caller holds the mutex. It returns nil if there is none.
+func (walletManager *WalletManager) resolve(id string) *Wallet {
+	if id != "" {
+		return walletManager.find(id)
+	}
+	if wallet := walletManager.find("default_wallet"); wallet != nil {
+		return wallet
+	}
+	if len(walletManager.wallets) > 0 {
+		return walletManager.wallets[0]
+	}
+	return nil
 }
 
 func (walletManager *WalletManager) find(id string) *Wallet {

@@ -4,6 +4,7 @@ import "bufio"
 import "encoding/base64"
 import "encoding/hex"
 import "encoding/json"
+import "errors"
 import "fmt"
 import "lbry/daemon/auth"
 import "lbry/daemon/blob"
@@ -19,6 +20,7 @@ import "os/exec"
 import "runtime/debug"
 import "strconv"
 import "strings"
+import "sync"
 import "time"
 
 import "google.golang.org/protobuf/encoding/protowire"
@@ -33,6 +35,7 @@ type RPCServer struct {
 	dhtNode       *dht.Node
 	httpServer    http.Server
 	walletManager *wallet.WalletManager
+	hub           wallet.Hub
 }
 
 func CreateServer(configuration settings.Configuration, authManager *auth.AuthManager, blobManager *blob.BlobManager, dhtNode *dht.Node, walletManager *wallet.WalletManager) *RPCServer {
@@ -45,6 +48,7 @@ func CreateServer(configuration settings.Configuration, authManager *auth.AuthMa
 		dhtNode:       dhtNode,
 		httpServer:    http.Server{Handler: rpcServeMux},
 		walletManager: walletManager,
+		hub:           hubClient{},
 	}
 
 	rpcServeMux.HandleFunc("/", server.handleJSONRPC)
@@ -548,12 +552,52 @@ func handleJSONRPCMessageClaimList(rpcServer RPCServer, w http.ResponseWriter, r
 
 // Hub connection limits. A hub name can resolve to several addresses, and one that accepts the
 // connection but never answers must not hold a request up.
-const hubDialTimeout = 3 * time.Second
+const (
+	hubDialTimeout = 3 * time.Second
+	// hubFirstByteTimeout is how long an address gets to start answering before the next is tried.
+	hubFirstByteTimeout = 6 * time.Second
+	// hubBackoff is how long an address that failed is tried last.
+	hubBackoff = 2 * time.Minute
+)
 
 // A variable so tests can shorten it.
 var hubCallTimeout = 15 * time.Second
 
 var lookupHost = net.LookupHost
+
+// hubDown remembers when each address last failed, so one dead address is not waited on again by every
+// request that follows (a balance makes dozens of calls).
+var hubDown = struct {
+	sync.Mutex
+	until map[string]time.Time
+}{until: map[string]time.Time{}}
+
+// orderAddresses puts addresses that recently failed after the ones that did not, keeping DNS order
+// within each group.
+func orderAddresses(addrs []string) []string {
+	hubDown.Lock()
+	defer hubDown.Unlock()
+	now := time.Now()
+	var healthy, failed []string
+	for _, addr := range addrs {
+		if hubDown.until[addr].After(now) {
+			failed = append(failed, addr)
+		} else {
+			healthy = append(healthy, addr)
+		}
+	}
+	return append(healthy, failed...)
+}
+
+func markHub(addr string, ok bool) {
+	hubDown.Lock()
+	defer hubDown.Unlock()
+	if ok {
+		delete(hubDown.until, addr)
+	} else {
+		hubDown.until[addr] = time.Now().Add(hubBackoff)
+	}
+}
 
 // SendJSON sends one JSON-RPC request to a wallet server and returns its decoded reply. It tries each
 // address the host resolves to, in turn, and moves on from one that fails or sends nothing.
@@ -567,11 +611,13 @@ func SendJSON(host string, port int, req any) (map[string]any, error) {
 		return nil, fmt.Errorf("looking up %s: %w", host, err)
 	}
 	var lastErr error = fmt.Errorf("%s has no addresses", host)
-	for _, addr := range addrs {
+	for _, addr := range orderAddresses(addrs) {
 		resp, err := sendJSONTo(net.JoinHostPort(addr, strconv.Itoa(port)), data)
 		if err == nil {
+			markHub(addr, true)
 			return resp, nil
 		}
+		markHub(addr, false)
 		lastErr = err
 	}
 	return nil, lastErr
@@ -583,12 +629,18 @@ func sendJSONTo(address string, data []byte) (map[string]any, error) {
 		return nil, err
 	}
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(hubCallTimeout))
+	start := time.Now()
+	conn.SetDeadline(start.Add(min(hubFirstByteTimeout, hubCallTimeout)))
 
 	if _, err := conn.Write(append(data, '\n')); err != nil {
 		return nil, fmt.Errorf("%s: %w", address, err)
 	}
-	line, err := bufio.NewReader(conn).ReadString('\n')
+	reader := bufio.NewReader(conn)
+	if _, err := reader.Peek(1); err != nil { // wait for the first byte of the reply
+		return nil, fmt.Errorf("%s: no reply: %w", address, err)
+	}
+	conn.SetDeadline(start.Add(hubCallTimeout)) // a reply that has started may take longer
+	line, err := reader.ReadString('\n')
 	line = strings.TrimRight(line, "\r\n")
 	if line == "" {
 		if err == nil {
@@ -1686,11 +1738,69 @@ func handleJSONRPCMessageWalletAdd(rpcServer RPCServer, w http.ResponseWriter, r
 func handleJSONRPCMessageWalletBalance(rpcServer RPCServer, w http.ResponseWriter, req *http.Request, params any) {
 	user, authenticated := rpcServer.authManager.ValidateUser(req)
 	if authenticated {
-		_ = user
-		sendErrorResponse(w, 501, "Wallet commands are not implemented for now.")
+		paramsMap, paramsMapOk := params.(map[string]any)
+		if !paramsMapOk {
+			paramsMap = map[string]any{}
+		}
+		walletID := ""
+		if value, has := paramsMap["wallet_id"]; has && value != nil {
+			var isString bool
+			if walletID, isString = value.(string); !isString {
+				sendErrorResponse(w, 400, "Parameter 'wallet_id' not of type string.")
+				return
+			}
+		}
+		confirmations := 0
+		if value, has := paramsMap["confirmations"]; has && value != nil {
+			number, isNumber := value.(float64)
+			if !isNumber || number != math.Trunc(number) {
+				sendErrorResponse(w, 400, "Parameter 'confirmations' not of type integer.")
+				return
+			}
+			confirmations = int(number)
+		}
+
+		balance, err := rpcServer.walletManager.Balance(user, rpcServer.hub, walletID, confirmations)
+		switch {
+		case errors.Is(err, wallet.ErrWalletNotFound), errors.Is(err, wallet.ErrUnsupportedConfirmations):
+			sendErrorResponse(w, 400, "Wallet does not exist or the request is not supported: "+err.Error())
+		case err != nil:
+			sendErrorResponse(w, 502, "Could not work out the balance with the wallet server: "+err.Error())
+		default:
+			sendResultResponse(w, map[string]any{
+				"total":     wallet.FormatLBC(balance.Total),
+				"available": wallet.FormatLBC(balance.Available),
+				"reserved":  wallet.FormatLBC(balance.Reserved),
+				"reserved_subtotals": map[string]any{
+					"claims":   "0.0",
+					"supports": "0.0",
+					"tips":     "0.0",
+				},
+			})
+		}
 		return
 	}
 	handleUnauthorized(w)
+}
+
+// hubClient is the wallet.Hub that talks to the wallet server.
+type hubClient struct{}
+
+func (hubClient) Call(method string, params any) (any, error) {
+	resp, err := SendJSON(TMP_HUB_HOSTNAME, 50001, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      rand.Int() + 1,
+		"method":  method,
+		"params":  params,
+	})
+	if err != nil {
+		return nil, err
+	}
+	result, has := resp["result"]
+	if !has {
+		return nil, fmt.Errorf("%s: %s", method, hubErrorMessage(resp))
+	}
+	return result, nil
 }
 
 func handleJSONRPCMessageWalletCreate(rpcServer RPCServer, w http.ResponseWriter, req *http.Request, params any) {
