@@ -25,10 +25,10 @@ type WalletManager interface {
 }
 
 type Wallet struct {
-	ID          string
-	Name        string
-	Accounts    []*Account
-	Preferences map[string]*Preference
+	ID          string                 `json:"-"`
+	Name        *string                `json:"name"`
+	Accounts    []*Account             `json:"accounts"`
+	Preferences map[string]*Preference `json:"preferences"`
 
 	locked    bool
 	encrypted bool   // lbry-sdk Wallet.is_encrypted: locked, or unlocked with a password
@@ -85,6 +85,15 @@ type Account struct {
 	AddressGenerator AddressGenerator           `json:"address_generator"`
 	ModifiedOn       int64                      `json:"modified_on,omitempty"`
 	Certificates     map[string]json.RawMessage `json:"certificates,omitempty"`
+}
+
+func (account *Account) CalculateID() error {
+	id, err := AddressFromExtendedPublicKey(account.PublicKey)
+	if err != nil {
+		return err
+	}
+	account.ID = id
+	return nil
 }
 
 type AddressGenerator struct {
@@ -152,44 +161,11 @@ func (account *Account) Unlock(password string) error {
 }
 
 type Preference struct {
-	TimeStamp int64
-	Value     any
+	TimeStamp float64 `json:"ts"`
+	Value     any     `json:"value"`
 }
 
 func (preference *Preference) SetNewValue(value any) {
-	preference.TimeStamp = time.Now().Unix()
+	preference.TimeStamp = float64(time.Now().Unix())
 	preference.Value = value
 }
-
-//	id, _ := AddressFromExtendedPublicKey(account.PublicKey)
-
-// AddressGeneratorName is the generator lbry-sdk uses when a wallet does not name one.
-
-// AddressGeneratorDetails returns the account's address generator the way lbry-sdk reports it:
-// the name and, for the deterministic chain, the gap and maximum uses of both chains, filling in defaults.
-// func (account *Account) AddressGeneratorDetails() map[string]any {
-// 	stored := map[string]any{}
-// 	if len(account.AddressGenerator) > 0 {
-// 		json.Unmarshal(account.AddressGenerator, &stored)
-// 	}
-// 	name, _ := stored["name"].(string)
-// 	if name == "" {
-// 		name = AddressGeneratorName
-// 	}
-// 	details := map[string]any{"name": name}
-// 	if name != AddressGeneratorName {
-// 		return details
-// 	}
-// 	for chain, defaultGap := range map[string]int{"receiving": 20, "change": 6} {
-// 		values := map[string]any{"gap": defaultGap, "maximum_uses_per_address": 1}
-// 		if given, ok := stored[chain].(map[string]any); ok {
-// 			for key := range values {
-// 				if value, ok := given[key]; ok {
-// 					values[key] = value
-// 				}
-// 			}
-// 		}
-// 		details[chain] = values
-// 	}
-// 	return details
-// }

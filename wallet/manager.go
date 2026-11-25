@@ -7,14 +7,8 @@ import (
 	"lbry/daemon/auth"
 	"os"
 	"path/filepath"
-	"sort"
 	"sync"
 )
-
-type WalletFile struct {
-	Name     string     `json:"name"`
-	Accounts []*Account `json:"accounts"`
-}
 
 type DefaultWalletManager struct {
 	mutex     sync.Mutex
@@ -38,44 +32,42 @@ func (walletManager *DefaultWalletManager) Load() error {
 		}
 		return err
 	}
+
 	var wallets []*Wallet
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(walletManager.directory, entry.Name()))
+		file := filepath.Join(walletManager.directory, entry.Name())
+
+		content, err := os.ReadFile(file)
 		if err != nil {
 			continue
 		}
-		var parsed WalletFile
-		if json.Unmarshal(data, &parsed) != nil {
+		wallet := &Wallet{
+			ID: entry.Name(),
+		}
+		if json.Unmarshal(content, wallet) != nil {
 			continue
 		}
-		name := parsed.Name
-		if name == "" {
-			name = entry.Name()
+		if wallet.Name == nil {
+			name := "Wallet"
+			wallet.Name = &name
 		}
-		locked := false
-		for _, account := range parsed.Accounts {
-			if account.Locked {
-				locked = true
+		for _, account := range wallet.Accounts {
+			err := account.CalculateID()
+			if err != nil {
+				continue
 			}
 		}
-		newWallet := &Wallet{
-			ID:       entry.Name(),
-			Name:     name,
-			Accounts: parsed.Accounts,
-			locked:   locked,
-			Preferences: map[string]*Preference{
-				"local": &Preference{},
-			},
+		if wallet.Preferences == nil {
+			wallet.Preferences = map[string]*Preference{
+				"local": {},
+			}
 		}
-		wallets = append(wallets, newWallet)
+		wallets = append(wallets, wallet)
 	}
-	sort.Slice(wallets, func(i, j int) bool { return wallets[i].ID < wallets[j].ID })
-	walletManager.mutex.Lock()
 	walletManager.wallets = wallets
-	walletManager.mutex.Unlock()
 	return nil
 }
 
